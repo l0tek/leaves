@@ -4,10 +4,12 @@ use serde::Deserialize;
 use sqlx::{SqlitePool, Row, sqlite::{SqliteConnectOptions, SqlitePoolOptions}};
 use std::path::PathBuf;
 mod metadata;
+mod dedup;
+mod ollama;
 mod classification;
 
 #[derive(Clone)]
-struct AppState { db: SqlitePool, files: PathBuf }
+struct AppState { db: SqlitePool, files: PathBuf, ollama_client: reqwest::Client, ollama_url: String, ollama_model: String, ollama_slots: std::sync::Arc<tokio::sync::Semaphore>, ollama_batch: std::sync::Arc<tokio::sync::Mutex<Option<ollama::BatchJob>>> }
 struct AppError(StatusCode, String);
 impl IntoResponse for AppError {
     fn into_response(self) -> Response { (self.0, self.1).into_response() }
@@ -32,20 +34,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS books (id TEXT PRIMARY KEY, title TEXT NOT NULL, author TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('unread','reading','read')), format TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)").execute(&db).await?;
     classification::migrate(&db).await?;
+    dedup::migrate(&db, &files).await?;
+    let ollama_client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(180)).build()?;
+    let ollama_url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://192.168.113.103:11434".into());
+    let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2:latest".into());
     let app = Router::new()
         .route("/", get(index))
         .route("/books", post(upload))
+        .route("/books/import", post(batch_upload).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)))
         .route("/books/{id}", post(update))
         .route("/books/{id}/delete", post(delete))
         .route("/books/{id}/download", get(download))
         .route("/books/{id}/suggest", post(suggest_classification))
+        .route("/books/{id}/ollama", post(ollama::suggest))
+        .route("/ollama/batch", get(ollama::progress).post(ollama::start_batch))
+        .route("/ollama/batch/cancel", post(ollama::cancel_batch))
         .route("/books/{id}/accept", post(accept_classification))
         .route("/books/{id}/dismiss", post(dismiss_classification))
         .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("style.css")) }))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::max(52 * 1024 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(AppState { db, files });
+        .with_state(AppState { db, files, ollama_client, ollama_url, ollama_model, ollama_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), ollama_batch: std::sync::Arc::new(tokio::sync::Mutex::new(None)) });
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Leaves läuft auf http://{addr}");
@@ -59,7 +69,7 @@ struct Search { #[serde(default)] q: String, #[serde(default)] status: String, #
 struct Book { id: String, title: String, author: String, status: String, format: String, size: i64, category: String, tags: Vec<String>, suggested_category: String, suggested_tags: String }
 
 async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Result<Html<String>, AppError> {
-    let rows = sqlx::query("SELECT books.*, (SELECT group_concat(name, ', ') FROM (SELECT name FROM book_tags WHERE book_id=books.id ORDER BY name)) AS tags FROM books WHERE (instr(lower(title),lower(?)) > 0 OR instr(lower(author),lower(?)) > 0) AND (? = '' OR status = ?) AND (? = '' OR category = ? OR (? = '__none' AND category = '')) AND (? = '' OR EXISTS(SELECT 1 FROM book_tags WHERE book_id=books.id AND name=?)) ORDER BY created_at DESC, id")
+    let rows = sqlx::query("SELECT books.id,books.title,books.author,books.status,books.format,books.size,books.category,books.suggested_category,books.suggested_tags, (SELECT group_concat(name, ', ') FROM (SELECT name FROM book_tags WHERE book_id=books.id ORDER BY name)) AS tags FROM books WHERE (instr(lower(title),lower(?)) > 0 OR instr(lower(author),lower(?)) > 0) AND (? = '' OR status = ?) AND (? = '' OR category = ? OR (? = '__none' AND category = '')) AND (? = '' OR EXISTS(SELECT 1 FROM book_tags WHERE book_id=books.id AND name=?)) ORDER BY created_at DESC, id")
         .bind(&search.q).bind(&search.q).bind(&search.status).bind(&search.status)
         .bind(&search.category).bind(&search.category).bind(&search.category)
         .bind(&search.tag).bind(search.tag.trim().to_lowercase()).fetch_all(&s.db).await?;
@@ -70,6 +80,8 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
     let finished: i64 = stats.get("finished");
     let reading: i64 = stats.get("reading");
     let count = books.len();
+    let missing_metadata: i64 = sqlx::query_scalar("SELECT count(*) FROM books WHERE trim(category)='' OR trim(author)='' OR NOT EXISTS(SELECT 1 FROM book_tags WHERE book_id=books.id)").fetch_one(&s.db).await?;
+    let batch_running = s.ollama_batch.lock().await.as_ref().is_some_and(|job| job.running);
     let content = dioxus_ssr::render_element(rsx! {
             head {
                 meta { charset: "utf-8" }
@@ -86,7 +98,16 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
                         div { strong { "{reading}" } span { "Gerade am Lesen" } }
                         div { strong { "{finished}" } span { "Zu Ende gelesen" } }
                     }
+                    section { class: "upload",
+                        h2 { "Fehlende Metadaten ergänzen" }
+                        p { "{missing_metadata} Bücher ohne Hauptkategorie, Schlagwörter oder Autor. Ollama ergänzt fehlende Einordnungen automatisch; Autoren werden nur aus Datei-Metadaten übernommen. Vorhandene Angaben bleiben erhalten." }
+                        p { class: "field-hint", "Auch vorläufige Einordnungen anhand von Titel und Autor werden gespeichert. Bitte die Ergebnisse prüfen. Die Verarbeitung läuft im Hintergrund weiter, wenn du die Seite verlässt." }
+                        if batch_running { a { class: "button primary", href: "/ollama/batch", "Fortschritt anzeigen" } }
+                        else { form { method: "post", action: "/ollama/batch", button { class: "primary", disabled: missing_metadata == 0, "Fehlende Metadaten mit Ollama ergänzen" } } }
+                        a { href: "/ollama/batch", "Letzten Sammellauf anzeigen" }
+                    }
                     div { class: "library-heading", h2 { "Dein Bücherregal" } span { "{count} Ergebnisse" } }
+                    if search.notice == "duplicate" { p { class: "notice", role: "status", "Diese Datei ist bereits in deiner Bibliothek. Der Import wurde übersprungen." } }
                     if search.notice == "no-subjects" { p { class: "notice", role: "status", "Keine verwertbaren Themen-Metadaten gefunden. Kategorie und Schlagwörter kannst du unter „Buch verwalten“ selbst festlegen." } }
                     form { class: "search", method: "get", action: "/",
                         input { name: "q", r#type: "search", value: "{search.q}", placeholder: "Nach Titel oder Autor suchen …", "aria-label": "Titel oder Autor" }
@@ -156,11 +177,25 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
                                             span { class: "field-hint", "Mit Komma trennen. Speichern bestätigt deine Einordnung und verwirft offene Vorschläge." }
                                             button { "Speichern" }
                                         }
+                                        form { method: "post", action: "/books/{book.id}/ollama",
+                                            p { class: "field-hint", "Ollama erhält Metadaten und einen kurzen Textauszug. Vorschläge vor dem Speichern prüfen. Kann bis zu drei Minuten dauern." }
+                                            button { "Metadaten mit Ollama ergänzen" }
+                                        }
                                         form { method: "post", action: "/books/{book.id}/suggest", button { "Vorschläge aus Datei ermitteln" } }
                                         form { method: "post", action: "/books/{book.id}/delete", label { class: "confirm", input { r#type: "checkbox", required: true } "Löschen bestätigen" } button { class: "danger", "Buch endgültig löschen" } }
                                     }
                                 }
                             }
+                        }
+                    }
+                    section { id: "batch", class: "upload",
+                        div { class: "eyebrow", "VIELE GESCHICHTEN AUF EINMAL" }
+                        h2 { "Ordner importieren" }
+                        p { "Wähle einen Ordner auf deinem Rechner. Unterordner werden einbezogen; EPUB, PDF, MOBI und AZW3 werden importiert. Andere Dateien werden übersprungen." }
+                        form { method: "post", action: "/books/import", enctype: "multipart/form-data",
+                            label { "Bücherordner", input { r#type: "file", name: "files", multiple: true, directory: true, required: true } }
+                            p { class: "field-hint", "Maximal 50 MiB pro Buch und 1 GiB pro Durchlauf. Identische Dateien werden übersprungen, auch bei anderem Dateinamen. Bitte warte nach dem Absenden auf den Importbericht." }
+                            button { class: "primary", r#type: "submit", "Alle Bücher im Ordner importieren" }
                         }
                     }
                     section { id: "upload", class: "upload",
@@ -215,6 +250,14 @@ async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> Result<R
     let (filename, format, bytes) = file.ok_or_else(|| bad("Bitte eine Datei auswählen"))?;
     classification::validate_category(&category)?;
     let tags = classification::tags(&tag_text)?;
+    let imported = store_book(&s, filename, format, bytes.to_vec(), title, author, category, tags).await?;
+    Ok(Redirect::to(if imported { "/" } else { "/?notice=duplicate" }))
+}
+
+async fn store_book(s: &AppState, filename: String, format: String, bytes: Vec<u8>, mut title: String, mut author: String, category: String, tags: Vec<String>) -> Result<bool, AppError> {
+    let hash = dedup::hash(&bytes);
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM books WHERE content_hash=?)").bind(&hash).fetch_one(&s.db).await?;
+    if exists { return Ok(false); }
     let (suggested_category, suggested_tags) = {
         let input = bytes.clone();
         let kind = format.clone();
@@ -229,17 +272,78 @@ async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> Result<R
     let id = uuid::Uuid::new_v4().to_string();
     let path = s.files.join(&id);
     tokio::fs::write(&path, &bytes).await?;
-    let result: Result<(), sqlx::Error> = async {
+    let result: Result<bool, sqlx::Error> = async {
         let mut tx = s.db.begin().await?;
-        sqlx::query("INSERT INTO books(id,title,author,format,size,category,suggested_category,suggested_tags) VALUES(?,?,?,?,?,?,?,?)")
+        let inserted = sqlx::query("INSERT INTO books(id,title,author,format,size,category,suggested_category,suggested_tags,content_hash) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM books WHERE content_hash=?) ON CONFLICT DO NOTHING")
             .bind(&id).bind(title.trim()).bind(author.trim()).bind(&format).bind(bytes.len() as i64)
-            .bind(category).bind(suggested_category).bind(suggested_tags).execute(&mut *tx).await?;
+            .bind(category).bind(suggested_category).bind(suggested_tags).bind(&hash).bind(&hash).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 { return Ok(false); }
         classification::replace_tags(&mut tx, &id, &tags).await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(true)
     }.await;
-    if let Err(e) = result { let _ = tokio::fs::remove_file(path).await; return Err(e.into()); }
-    Ok(Redirect::to("/"))
+    match result {
+        Ok(true) => Ok(true),
+        Ok(false) => { tokio::fs::remove_file(path).await?; Ok(false) }
+        Err(e) => { let _ = tokio::fs::remove_file(path).await; Err(e.into()) }
+    }
 }
+// Read one file at a time and discard oversized files without retaining their contents.
+async fn batch_upload(State(s): State<AppState>, mut multipart: Multipart) -> Result<Html<String>, AppError> {
+    let (mut imported, mut skipped, mut failed, mut duplicates) = (0usize, 0usize, 0usize, 0usize);
+    let mut errors = Vec::new();
+    let mut incomplete = false;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => { incomplete = true; break; }
+        };
+        let mut field = field;
+        if field.name() != Some("files") { continue; }
+        let filename = field.file_name().unwrap_or("").replace('\\', "/");
+        let filename = filename.rsplit('/').next().unwrap_or("").to_string();
+        let format = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+        if !["epub", "pdf", "mobi", "azw3"].contains(&format.as_str()) { skipped += 1; continue; }
+        let mut bytes = Vec::new();
+        let mut oversized = false;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if !oversized && bytes.len() + chunk.len() <= 50 * 1024 * 1024 { bytes.extend_from_slice(&chunk); }
+                    else { oversized = true; bytes.clear(); }
+                }
+                Ok(None) => break,
+                Err(_) => { incomplete = true; break; }
+            }
+        }
+        if incomplete { failed += 1; errors.push(format!("{filename}: Übertragung unvollständig")); break; }
+        let result = if oversized || bytes.is_empty() {
+            Err(bad("Dateigröße muss zwischen 1 Byte und 50 MiB liegen"))
+        } else {
+            store_book(&s, filename.clone(), format, bytes, String::new(), String::new(), String::new(), Vec::new()).await
+        };
+        match result {
+            Ok(true) => imported += 1,
+            Ok(false) => { skipped += 1; duplicates += 1; }
+            Err(error) => { failed += 1; errors.push(format!("{filename}: {}", error.1)); }
+        }
+    }
+    let content = dioxus_ssr::render_element(rsx! {
+        head { meta { charset: "utf-8" } meta { name: "viewport", content: "width=device-width, initial-scale=1" } title { "Leaves · Importbericht" } link { rel: "stylesheet", href: "/style.css" } }
+        body { main { section { class: "upload",
+            h1 { "Importbericht" }
+            p { role: "status", "{imported} importiert · {skipped} übersprungen · {failed} fehlgeschlagen" }
+            p { "Davon {duplicates} bereits vorhanden." }
+            if incomplete { p { "Die Übertragung wurde abgebrochen oder das Gesamtlimit von 1 GiB überschritten. Bereits importierte Bücher bleiben erhalten; weitere Dateien wurden nicht verarbeitet." } }
+            if imported + skipped + failed == 0 && !incomplete { p { "Keine Dateien empfangen. Bitte wähle einen Ordner mit Büchern." } }
+            ul { for error in &errors { li { "{error}" } } }
+            a { class: "button primary", href: "/", "Zur Bibliothek" }
+        } } }
+    });
+    Ok(Html(format!("<!DOCTYPE html><html lang=\"de\">{content}</html>")))
+}
+
 #[derive(Deserialize)]
 struct Edit { title: String, author: String, status: String, category: Option<String>, tags: Option<String> }
 fn validate(title: &str, author: &str, status: &str) -> Result<(), AppError> {

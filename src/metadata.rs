@@ -100,3 +100,95 @@ fn mobi(bytes: &[u8]) -> Option<Metadata> {
     result.author = authors.join(", ");
     Some(result)
 }
+
+/// Small local context for metadata suggestions; no OCR or MOBI text decoding.
+pub fn excerpt(format: &str, bytes: &[u8]) -> String {
+    let mut text = String::new();
+    if format == "epub" {
+        if let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) {
+            let names = epub_reading_order(&mut archive);
+            for name in names {
+                if let Some(xml) = zip_text(&mut archive, &name) {
+                    if let Ok(doc) = roxmltree::Document::parse(&xml) {
+                        let mut section = String::new();
+                        for node in doc.descendants().filter(|n| n.is_text() && !n.ancestors().any(|a| a.has_tag_name("script") || a.has_tag_name("style"))) {
+                            section.push_str(node.text().unwrap_or_default());
+                            section.push(' ');
+                            if section.len() >= 16000 { break; }
+                        }
+                        text.push_str(&clean(&section, 2000));
+                        text.push(' ');
+                        if text.chars().count() >= 8000 { break; }
+                    }
+                }
+                if text.chars().count() >= 8000 { break; }
+            }
+        }
+    } else if format == "pdf" {
+        if let Ok(doc) = lopdf::Document::load_mem(bytes) {
+            let pages: Vec<u32> = doc.get_pages().keys().copied().take(3).collect();
+            text = doc.extract_text_with_limit(&pages, 2 * 1024 * 1024).unwrap_or_default();
+        }
+    }
+    clean(&text, 8000)
+}
+
+// Follow the EPUB spine instead of ZIP entry order (which often starts with navigation).
+fn epub_reading_order(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
+    let ordered = (|| -> Option<Vec<String>> {
+        let container = zip_text(archive, "META-INF/container.xml")?;
+        let container = roxmltree::Document::parse(&container).ok()?;
+        let package_path = container.descendants().find(|n| n.has_tag_name("rootfile"))?.attribute("full-path")?;
+        let package = zip_text(archive, package_path)?;
+        let doc = roxmltree::Document::parse(&package).ok()?;
+        let base = std::path::Path::new(package_path).parent()?;
+        let mut result = Vec::new();
+        for itemref in doc.descendants().filter(|n| n.has_tag_name("itemref") && n.attribute("linear") != Some("no")) {
+            let Some(id) = itemref.attribute("idref") else { continue; };
+            let Some(item) = doc.descendants().find(|n| n.has_tag_name("item") && n.attribute("id") == Some(id)) else { continue; };
+            if item.attribute("media-type") != Some("application/xhtml+xml") || item.attribute("properties").unwrap_or("").split_whitespace().any(|p| p == "nav") { continue; }
+            let Some(href) = item.attribute("href") else { continue; };
+            let joined = base.join(href.split('#').next().unwrap_or(href));
+            let mut parts = Vec::new();
+            for part in joined.components() {
+                match part { std::path::Component::ParentDir => { parts.pop(); }, std::path::Component::Normal(p) => parts.push(p.to_string_lossy().to_string()), _ => () }
+            }
+            result.push(parts.join("/"));
+            if result.len() == 6 { break; }
+        }
+        Some(result)
+    })().unwrap_or_default();
+    if ordered.is_empty() {
+        archive.file_names().filter(|n| [".xhtml", ".html", ".htm"].iter().any(|ext| n.to_lowercase().ends_with(ext))).take(6).map(str::to_owned).collect()
+    } else { ordered }
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn epub_context_follows_spine_and_keeps_later_sections() {
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut output);
+            let files = [
+                ("nav.xhtml", "<html><body>Falsche Archiv-Reihenfolge</body></html>".to_string()),
+                ("META-INF/container.xml", "<container><rootfiles><rootfile full-path=\"OPS/book.opf\"/></rootfiles></container>".to_string()),
+                ("OPS/book.opf", "<package><manifest><item id=\"first\" href=\"first.xhtml\" media-type=\"application/xhtml+xml\"/><item id=\"second\" href=\"../second.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"first\"/><itemref idref=\"second\"/></spine></package>".to_string()),
+                ("OPS/first.xhtml", format!("<html><body>{}</body></html>", "Werbung ".repeat(2000))),
+                ("second.xhtml", "<html><body><h1>Der richtige Buchanfang</h1><script>nicht aufnehmen</script><p>Wichtiger Inhalt.</p></body></html>".to_string()),
+            ];
+            for (name, text) in files {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(text.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let text = excerpt("epub", &output.into_inner());
+        assert!(text.contains("Der richtige Buchanfang"));
+        assert!(!text.contains("Falsche Archiv-Reihenfolge"));
+        assert!(!text.contains("nicht aufnehmen"));
+        assert!(text.chars().count() <= 8000);
+    }
+}
