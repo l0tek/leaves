@@ -1,8 +1,31 @@
 # Leaves – E-Book-Verwaltung
 
-Rust, Dioxus SSR, Axum und SQLite. Deutsche, responsive Oberfläche mit Upload, Titel-/Autorsuche, Lesestatus, Metadatenbearbeitung, Download und bestätigtem Löschen. Unterstützt EPUB, PDF, MOBI und AZW3 bis 50 MiB. Die Buchcover sind typografische Platzhalter. Kein integrierter Reader, keine DRM-Entfernung.
+Rust, Dioxus SSR, Axum und SQLite. Deutsche, responsive Oberfläche mit Upload, Titel-/Autorsuche, Lesestatus, Metadatenbearbeitung, Download und bestätigtem Löschen. Unterstützt EPUB, PDF, MOBI und AZW3 bis 50 MiB. Die Buchcover sind typografische Platzhalter. Integrierter EPUB-Reader mit epub.js; keine DRM-Entfernung.
 
 Beim Hochladen werden leere Titel-/Autorfelder automatisch aus Metadaten ergänzt: EPUB (OPF), PDF (Info-Dictionary) und MOBI/AZW3 (MOBI-/EXTH-Header). Mehrere Autoren werden zusammengeführt. Manuelle Eingaben haben pro Feld Vorrang. Fehlen lesbare Metadaten, dient der Dateiname als Titel und der Autor bleibt leer. Die Erkennung erfolgt beim Absenden des Uploads, ohne externe Dienste; fehlerhafte oder verschlüsselte Metadaten können unerkannt bleiben. Bereits gespeicherte Bücher bleiben unverändert.
+
+## EPUB lesen und Autoren filtern
+
+EPUB-Bücher öffnen über „Jetzt lesen“ den integrierten Reader. Er bietet
+Vorwärts-/Rückwärtsblättern (auch mit Pfeiltasten), ein Inhaltsverzeichnis und
+vier Schriftgrößen. Leseposition und Schriftgröße werden pro Buch im
+Local Storage dieses Browsers gespeichert; sie werden nicht zwischen Geräten
+synchronisiert. EPUBs werden vollständig im Browser geladen. Für den Reader
+ist JavaScript erforderlich; die Bibliothek bleibt ohne JavaScript nutzbar.
+PDF, MOBI und AZW3 können weiterhin heruntergeladen werden.
+
+Die eingebundenen Versionen epub.js 0.3.93 und JSZip 3.10.1 werden lokal vom
+Leaves-Server ausgeliefert; für die Reader-Bibliotheken ist kein CDN-Zugriff
+nötig. JavaScript innerhalb der EPUB-Inhalte bleibt im epub.js-Sandbox deaktiviert.
+Verschlüsselte oder beschädigte EPUBs können nicht gelesen werden. Extern im
+EPUB referenzierte Ressourcen können Netzwerkzugriffe auslösen.
+
+Ein Klick auf einen Autor im Regal oder Reader öffnet alle Bücher mit exakt
+diesem gespeicherten Autorfeld. Der Autorfilter lässt sich mit Suche, Lesestatus,
+Kategorie und Schlagwort kombinieren. „Zurücksetzen“ entfernt alle Filter.
+Bei mehreren gemeinsam gespeicherten Autoren gilt das gesamte Autorfeld.
+Ein Klick auf ein Schlagwort im Bücherregal öffnet alle Bücher mit genau diesem
+Schlagwort. Weitere Filter lassen sich anschließend über das Suchformular ergänzen.
 
 ## Ordnerimport
 
@@ -63,9 +86,17 @@ python tests/classification.py
 python tests/batch.py
 # Isolierter Test mit temporärer Datenbank (lokales Binary erforderlich):
 cargo build
+python tests/reader.py
 python tests/dedup.py
 python tests/ollama.py
 python tests/ollama_batch.py
+```
+
+Optional prüft `tests/reader.py` zusätzlich den Reader in Chromium mit
+Playwright (installiertes Node.js, Paket `playwright` und dessen Chromium vorausgesetzt):
+
+```sh
+LEAVES_BROWSER_TEST=1 python tests/reader.py
 ```
 
 Ein separater Docker-Test prüft die Migration einer alten Datenbank und den Datenerhalt nach einem Neustart in einem temporären Container:
@@ -82,6 +113,8 @@ Für eine konsistente Sicherung den Dienst anhalten und das gesamte Volume inklu
 
 ## Schnittstellen
 
+- `GET /books/{id}/read`: EPUB-Reader (415 für andere Formate)
+- `GET /?author=…`: Exakter Autorfilter, mit weiteren Filtern kombinierbar
 - `GET /health`: SQLite-Verbindungsprüfung
 - `GET /?q=…&status=reading`: Suche und Filter (`unread`, `reading`, `read`)
 - `POST /books`: Multipart-Felder `file`, `title`, `author`

@@ -10,6 +10,7 @@ FROM debian:bookworm-slim
 RUN groupadd --gid 10001 leaves && useradd --uid 10001 --gid leaves --create-home leaves \
     && mkdir /data && chown leaves:leaves /data
 COPY --from=builder /app/leaves /usr/local/bin/leaves
+COPY src/vendor/epub.LICENSE src/vendor/jszip.LICENSE /usr/share/doc/leaves/
 USER leaves
 ENV DATA_DIR=/data LISTEN_ADDR=0.0.0.0:8080
 VOLUME ["/data"]

@@ -7,6 +7,7 @@ mod metadata;
 mod dedup;
 mod ollama;
 mod classification;
+mod reader;
 
 #[derive(Clone)]
 struct AppState { db: SqlitePool, files: PathBuf, ollama_client: reqwest::Client, ollama_url: String, ollama_model: String, ollama_slots: std::sync::Arc<tokio::sync::Semaphore>, ollama_batch: std::sync::Arc<tokio::sync::Mutex<Option<ollama::BatchJob>>> }
@@ -45,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/books/{id}", post(update))
         .route("/books/{id}/delete", post(delete))
         .route("/books/{id}/download", get(download))
+        .route("/books/{id}/read", get(reader::page))
+        .route("/reader.js", get(reader::script))
+        .route("/vendor/epub.min.js", get(reader::epub_script))
+        .route("/vendor/jszip.min.js", get(reader::zip_script))
         .route("/books/{id}/suggest", post(suggest_classification))
         .route("/books/{id}/ollama", post(ollama::suggest))
         .route("/ollama/batch", get(ollama::progress).post(ollama::start_batch))
@@ -64,15 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[derive(Deserialize, Default)]
-struct Search { #[serde(default)] q: String, #[serde(default)] status: String, #[serde(default)] category: String, #[serde(default)] tag: String, #[serde(default)] notice: String }
+struct Search { #[serde(default)] author: String, #[serde(default)] q: String, #[serde(default)] status: String, #[serde(default)] category: String, #[serde(default)] tag: String, #[serde(default)] notice: String }
 #[derive(Clone)]
 struct Book { id: String, title: String, author: String, status: String, format: String, size: i64, category: String, tags: Vec<String>, suggested_category: String, suggested_tags: String }
 
 async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Result<Html<String>, AppError> {
-    let rows = sqlx::query("SELECT books.id,books.title,books.author,books.status,books.format,books.size,books.category,books.suggested_category,books.suggested_tags, (SELECT group_concat(name, ', ') FROM (SELECT name FROM book_tags WHERE book_id=books.id ORDER BY name)) AS tags FROM books WHERE (instr(lower(title),lower(?)) > 0 OR instr(lower(author),lower(?)) > 0) AND (? = '' OR status = ?) AND (? = '' OR category = ? OR (? = '__none' AND category = '')) AND (? = '' OR EXISTS(SELECT 1 FROM book_tags WHERE book_id=books.id AND name=?)) ORDER BY created_at DESC, id")
+    let rows = sqlx::query("SELECT books.id,books.title,books.author,books.status,books.format,books.size,books.category,books.suggested_category,books.suggested_tags, (SELECT group_concat(name, ', ') FROM (SELECT name FROM book_tags WHERE book_id=books.id ORDER BY name)) AS tags FROM books WHERE (instr(lower(title),lower(?)) > 0 OR instr(lower(author),lower(?)) > 0) AND (? = '' OR status = ?) AND (? = '' OR category = ? OR (? = '__none' AND category = '')) AND (? = '' OR EXISTS(SELECT 1 FROM book_tags WHERE book_id=books.id AND name=?)) AND (? = '' OR author = ?) ORDER BY created_at DESC, id")
         .bind(&search.q).bind(&search.q).bind(&search.status).bind(&search.status)
         .bind(&search.category).bind(&search.category).bind(&search.category)
-        .bind(&search.tag).bind(search.tag.trim().to_lowercase()).fetch_all(&s.db).await?;
+        .bind(&search.tag).bind(search.tag.trim().to_lowercase())
+        .bind(&search.author).bind(&search.author).fetch_all(&s.db).await?;
     let books: Vec<Book> = rows.iter().map(|r| Book { id: r.get("id"), title: r.get("title"), author: r.get("author"), status: r.get("status"), format: r.get("format"), size: r.get("size"), category: r.get("category"), tags: r.get::<Option<String>, _>("tags").unwrap_or_default().split(", ").filter(|t| !t.is_empty()).map(str::to_string).collect(), suggested_category: r.get("suggested_category"), suggested_tags: r.get("suggested_tags") }).collect();
     let available_tags: Vec<String> = sqlx::query_scalar("SELECT DISTINCT name FROM book_tags ORDER BY name").fetch_all(&s.db).await?;
     let stats = sqlx::query("SELECT count(*) AS total, coalesce(sum(status='read'),0) AS finished, coalesce(sum(status='reading'),0) AS reading FROM books").fetch_one(&s.db).await?;
@@ -109,7 +115,9 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
                     div { class: "library-heading", h2 { "Dein Bücherregal" } span { "{count} Ergebnisse" } }
                     if search.notice == "duplicate" { p { class: "notice", role: "status", "Diese Datei ist bereits in deiner Bibliothek. Der Import wurde übersprungen." } }
                     if search.notice == "no-subjects" { p { class: "notice", role: "status", "Keine verwertbaren Themen-Metadaten gefunden. Kategorie und Schlagwörter kannst du unter „Buch verwalten“ selbst festlegen." } }
+                    if !search.author.is_empty() { p { class: "notice", "Bücher von {search.author}" } }
                     form { class: "search", method: "get", action: "/",
+                        input { name: "author", r#type: "hidden", value: "{search.author}" }
                         input { name: "q", r#type: "search", value: "{search.q}", placeholder: "Nach Titel oder Autor suchen …", "aria-label": "Titel oder Autor" }
                         select { name: "status", "aria-label": "Lesestatus",
                             option { value: "", selected: search.status.is_empty(), "Alle Bücher" }
@@ -137,15 +145,15 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
                                     span { class: "cover-format", "{book.format}" }
                                     div { class: "cover-ornament", "aria-hidden": "true" }
                                     h3 { class: if book.title.chars().count() > 55 { "long-title" } else { "" }, lang: "de", "{book.title}" }
-                                    p { class: "cover-author", "{book.author}" }
+                                    p { class: "cover-author", if !book.author.is_empty() { a { href: author_url(&book.author), "{book.author}" } } }
                                 }
                                 div { class: "book-info",
                                     span { class: "badge", "{status_label(&book.status)}" }
                                     h3 { "{book.title}" }
-                                    p { "{book.author}" }
+                                    p { if !book.author.is_empty() { a { class: "author-link", href: author_url(&book.author), "{book.author}" } } }
                                     div { class: "classification",
                                         span { class: "category", if book.category.is_empty() { "Ohne Kategorie" } else { "{book.category}" } }
-                                        for tag in &book.tags { span { class: "tag", "{tag}" } }
+                                        for tag in &book.tags { a { class: "tag", href: filter_url("tag", tag), "{tag}" } }
                                     }
                                     if !book.suggested_category.is_empty() || !book.suggested_tags.is_empty() {
                                         div { class: "suggestion",
@@ -159,6 +167,7 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
                                         }
                                     }
                                     small { "{book.format} · {book.size / 1024} KB" }
+                                    if book.format == "epub" { a { class: "button primary read-link", href: "/books/{book.id}/read", "Jetzt lesen" } }
                                     a { class: "download", href: "/books/{book.id}/download", "Herunterladen ↓" }
                                     details { summary { "Buch verwalten" }
                                         form { method: "post", action: "/books/{book.id}",
@@ -224,6 +233,16 @@ async fn index(State(s): State<AppState>, Query(search): Query<Search>) -> Resul
     });
     Ok(Html(format!("<!DOCTYPE html><html lang=\"de\">{content}</html>")))
 }
+fn author_url(author: &str) -> String { filter_url("author", author) }
+
+fn filter_url(field: &str, value: &str) -> String {
+    let encoded: String = value.as_bytes().iter().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (*b as char).to_string(),
+        _ => format!("%{b:02X}"),
+    }).collect();
+    format!("/?{field}={encoded}")
+}
+
 fn status_label(s: &str) -> &str { match s { "reading" => "Lese ich gerade", "read" => "Gelesen", _ => "Ungelesen" } }
 
 async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> Result<Redirect, AppError> {
