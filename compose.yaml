@@ -1,0 +1,13 @@
+services:
+  leaves:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - library:/data
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  library:
